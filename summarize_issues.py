@@ -8,12 +8,14 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
 
 
 DEFAULT_MODEL = "qwen3.5:9b"
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
+DEFAULT_API_MODE = "ollama"
 DEFAULT_INPUT_LIMIT = 2000
 DEFAULT_MAX_TOKENS = 160
 DEFAULT_NUM_CTX = 4096
@@ -151,35 +153,93 @@ def create_openai_client(timeout: float) -> OpenAI:
     return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
 
 
-def summarize_record(
+def ollama_native_base_url() -> str:
+    base_url = os.getenv("OLLAMA_BASE_URL") or os.getenv("OPENAI_BASE_URL") or DEFAULT_BASE_URL
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    return base_url
+
+
+def summarize_with_openai_compat(
     client: OpenAI,
+    model: str,
+    max_tokens: int,
+    num_ctx: int,
+    messages: list[dict[str, str]],
+) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=max_tokens,
+        extra_body={
+            "reasoning_effort": "none",
+            "reasoning": {"effort": "none"},
+            "think": False,
+            "options": {
+                "num_ctx": num_ctx,
+                "num_predict": max_tokens,
+                "temperature": 0.2,
+            },
+            "keep_alive": "10m",
+        },
+    )
+    return response_content(response)
+
+
+def summarize_with_ollama_native(
+    model: str,
+    max_tokens: int,
+    num_ctx: int,
+    messages: list[dict[str, str]],
+    timeout: float,
+) -> str:
+    response = httpx.post(
+        f"{ollama_native_base_url()}/api/chat",
+        json={
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "options": {
+                "num_ctx": num_ctx,
+                "num_predict": max_tokens,
+                "temperature": 0.2,
+            },
+            "keep_alive": "10m",
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return ((data.get("message") or {}).get("content")) or data.get("response") or ""
+
+
+def summarize_record(
+    client: OpenAI | None,
     record: dict[str, Any],
     model: str,
     max_chars: int,
     max_tokens: int,
     num_ctx: int,
+    timeout: float,
+    api_mode: str,
 ) -> str:
     issue_context = build_issue_context(record, max_chars)
     user_prompt = USER_PROMPT_TEMPLATE.format(issue_context=issue_context)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
     for attempt, attempt_max_tokens in enumerate((max_tokens, max(max_tokens * 3, 320)), start=1):
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            max_tokens=attempt_max_tokens,
-            extra_body={
-                "options": {
-                    "num_ctx": num_ctx,
-                    "num_predict": attempt_max_tokens,
-                    "temperature": 0.2,
-                },
-                "keep_alive": "10m",
-            },
-        )
-        raw_content = response_content(response)
+        if api_mode == "ollama":
+            raw_content = summarize_with_ollama_native(model, attempt_max_tokens, num_ctx, messages, timeout)
+        else:
+            if client is None:
+                raise RuntimeError("OpenAI client is not initialized.")
+            raw_content = summarize_with_openai_compat(client, model, attempt_max_tokens, num_ctx, messages)
         summary = clean_one_sentence(raw_content)
         if summary:
             return summary
@@ -231,6 +291,7 @@ def summarize_issues(
     limit: int | None,
     timeout: float,
     resume: bool,
+    api_mode: str,
 ) -> None:
     records = read_issue_json_files(input_dir)
     if limit is not None:
@@ -238,7 +299,10 @@ def summarize_issues(
     if not records:
         raise RuntimeError(f"No JSON files found in {input_dir}")
 
-    client = create_openai_client(timeout)
+    if api_mode not in {"ollama", "openai"}:
+        raise ValueError("--api-mode must be either 'ollama' or 'openai'.")
+
+    client = create_openai_client(timeout) if api_mode == "openai" else None
     existing_rows = load_existing_rows(output_csv) if resume else []
     rows_by_number = {row.get("番号"): row for row in existing_rows if row.get("番号")}
     done_numbers = {number for number, row in rows_by_number.items() if row.get("LLMによる進捗要約")}
@@ -250,7 +314,7 @@ def summarize_issues(
 
         title = record.get("title") or ""
         print(f"[{index}/{len(records)}] Summarizing {number} {title}")
-        summary = summarize_record(client, record, model, max_chars, max_tokens, num_ctx)
+        summary = summarize_record(client, record, model, max_chars, max_tokens, num_ctx, timeout, api_mode)
         rows_by_number[number] = build_row(record, summary)
         save_rows(records, rows_by_number, output_csv)
 
@@ -299,6 +363,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Ollama context window option. Default: {DEFAULT_NUM_CTX}",
     )
     parser.add_argument(
+        "--api-mode",
+        choices=["ollama", "openai"],
+        default=os.getenv("API_MODE") or DEFAULT_API_MODE,
+        help="API mode. Use 'ollama' for native /api/chat with think=false, or 'openai' for /v1 compatibility. Default: ollama",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         help="Only summarize the first N JSON files. Useful for connection tests.",
@@ -329,6 +399,7 @@ def main() -> None:
         args.limit,
         args.timeout,
         not args.no_resume,
+        args.api_mode,
     )
 
 

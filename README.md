@@ -19,6 +19,7 @@ Ollamaを使う環境では、必要に応じて以下も設定します。
 OPENAI_BASE_URL=http://localhost:11434/v1
 OPENAI_API_KEY=ollama
 OPENAI_MODEL=qwen3.5:9b
+API_MODE=ollama
 ```
 
 ## A. GitHubデータ取得
@@ -60,17 +61,19 @@ python summarize_issues.py --input-dir output/issues --output-csv output/weekly_
 GTX1080 Ti 11GBなどVRAMに余裕が少ない環境では、まず以下の軽量設定を推奨します。
 
 ```powershell
-python summarize_issues.py --input-dir output/issues --output-csv output/weekly_report.csv --max-chars 1200 --max-tokens 160 --num-ctx 2048
+python summarize_issues.py --input-dir output/issues --output-csv output/weekly_report.csv --api-mode ollama --max-chars 1200 --max-tokens 160 --num-ctx 2048
 ```
 
 CSVは1件ごとに保存され、同じ出力先で再実行すると要約済みの行はスキップします。最初から作り直したい場合は `--no-resume` を付けます。
 
 `LLMによる進捗要約` が空のCSVができた場合は、同じ出力先で再実行してください。空の行だけ再処理されます。
 
+`qwen3.5` などのThinkingモデルでは、OllamaのOpenAI互換APIだと最終回答の `content` が空になることがあります。このため、Ollama利用時は既定の `--api-mode ollama` のまま実行してください。これはOllamaネイティブAPI `/api/chat` に `think:false` を渡します。
+
 接続確認だけを軽く行う場合は、先頭1件だけ処理できます。
 
 ```powershell
-python summarize_issues.py --input-dir output/issues --output-csv output/test_report.csv --limit 1 --max-chars 1200 --max-tokens 160 --num-ctx 2048
+python summarize_issues.py --input-dir output/issues --output-csv output/test_report.csv --api-mode ollama --limit 1 --max-chars 1200 --max-tokens 160 --num-ctx 2048
 ```
 
 Ollama側でGPUが使われているかは、サーバー側で次を確認します。
@@ -117,6 +120,7 @@ curl http://localhost:11434/v1/models
 OPENAI_BASE_URL=http://localhost:11434/v1
 OPENAI_API_KEY=ollama
 OPENAI_MODEL=qwen3.5:9b
+API_MODE=ollama
 ```
 
 Ollamaが別ホストで動いている場合は、`OPENAI_BASE_URL=http://<server-host>:11434/v1` のように変更します。
@@ -124,7 +128,7 @@ Ollamaが別ホストで動いている場合は、`OPENAI_BASE_URL=http://<serv
 6. Aの出力済みJSONを `output/issues` に置き、Bを実行します。
 
 ```bash
-python summarize_issues.py --input-dir output/issues --output-csv output/test_report.csv --limit 1 --max-chars 1200 --max-tokens 160 --num-ctx 2048
+python summarize_issues.py --input-dir output/issues --output-csv output/test_report.csv --api-mode ollama --limit 1 --max-chars 1200 --max-tokens 160 --num-ctx 2048
 ```
 
 7. 1件の要約が成功したら、全件を処理します。
