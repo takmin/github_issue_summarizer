@@ -15,7 +15,7 @@ from openai import OpenAI
 DEFAULT_MODEL = "qwen3.5:9b"
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
 DEFAULT_INPUT_LIMIT = 2000
-DEFAULT_MAX_TOKENS = 120
+DEFAULT_MAX_TOKENS = 160
 DEFAULT_NUM_CTX = 4096
 
 SYSTEM_PROMPT = (
@@ -64,9 +64,15 @@ def number_label(number: Any) -> str:
 
 def clean_one_sentence(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = " ".join(text.strip().split())
     text = text.strip("\"'`「」")
     return text
+
+
+def response_content(response: Any) -> str:
+    message = response.choices[0].message
+    return message.content or ""
 
 
 def trim_context(text: str, max_chars: int) -> str:
@@ -154,25 +160,36 @@ def summarize_record(
     num_ctx: int,
 ) -> str:
     issue_context = build_issue_context(record, max_chars)
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT_TEMPLATE.format(issue_context=issue_context)},
-        ],
-        temperature=0.2,
-        max_tokens=max_tokens,
-        extra_body={
-            "options": {
-                "num_ctx": num_ctx,
-                "num_predict": max_tokens,
-                "temperature": 0.2,
+    user_prompt = USER_PROMPT_TEMPLATE.format(issue_context=issue_context)
+    for attempt, attempt_max_tokens in enumerate((max_tokens, max(max_tokens * 3, 320)), start=1):
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=attempt_max_tokens,
+            extra_body={
+                "options": {
+                    "num_ctx": num_ctx,
+                    "num_predict": attempt_max_tokens,
+                    "temperature": 0.2,
+                },
+                "keep_alive": "10m",
             },
-            "keep_alive": "10m",
-        },
+        )
+        raw_content = response_content(response)
+        summary = clean_one_sentence(raw_content)
+        if summary:
+            return summary
+        if attempt == 1:
+            print("  Empty summary returned; retrying once with a larger output limit.")
+
+    raise RuntimeError(
+        f"LLM returned an empty summary for {number_label(record.get('number'))}. "
+        "Try increasing --max-tokens or using a non-thinking model/tag."
     )
-    content = response.choices[0].message.content or ""
-    return clean_one_sentence(content)
 
 
 def build_row(record: dict[str, Any], summary: str) -> dict[str, str]:
@@ -194,6 +211,16 @@ def load_existing_rows(output_csv: Path) -> list[dict[str, Any]]:
     return pd.read_csv(output_csv, dtype=str).fillna("").to_dict("records")
 
 
+def save_rows(records: list[dict[str, Any]], rows_by_number: dict[str, dict[str, Any]], output_csv: Path) -> None:
+    rows = []
+    for record in records:
+        number = number_label(record.get("number"))
+        if number in rows_by_number:
+            rows.append(rows_by_number[number])
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
+
+
 def summarize_issues(
     input_dir: Path,
     output_csv: Path,
@@ -212,8 +239,9 @@ def summarize_issues(
         raise RuntimeError(f"No JSON files found in {input_dir}")
 
     client = create_openai_client(timeout)
-    rows: list[dict[str, Any]] = load_existing_rows(output_csv) if resume else []
-    done_numbers = {row.get("番号") for row in rows if row.get("LLMによる進捗要約")}
+    existing_rows = load_existing_rows(output_csv) if resume else []
+    rows_by_number = {row.get("番号"): row for row in existing_rows if row.get("番号")}
+    done_numbers = {number for number, row in rows_by_number.items() if row.get("LLMによる進捗要約")}
     for index, record in enumerate(records, start=1):
         number = number_label(record.get("number"))
         if resume and number in done_numbers:
@@ -223,13 +251,11 @@ def summarize_issues(
         title = record.get("title") or ""
         print(f"[{index}/{len(records)}] Summarizing {number} {title}")
         summary = summarize_record(client, record, model, max_chars, max_tokens, num_ctx)
-        rows.append(build_row(record, summary))
-        output_csv.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
+        rows_by_number[number] = build_row(record, summary)
+        save_rows(records, rows_by_number, output_csv)
 
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
-    print(f"Saved {len(rows)} rows to {output_csv}")
+    save_rows(records, rows_by_number, output_csv)
+    print(f"Saved {len(rows_by_number)} rows to {output_csv}")
 
 
 def build_parser() -> argparse.ArgumentParser:
