@@ -51,16 +51,37 @@ python summarize_issues.py --input-dir output/issues --output-csv output/weekly_
 python summarize_issues.py --input-dir output/issues --output-csv output/weekly_report.csv --model qwen3.5:9b
 ```
 
-1件あたりの入力が長い場合は、直近の内容を優先してデフォルト4,000文字にトリミングします。変更する場合は `--max-chars` を使います。
+1件あたりの入力が長い場合は、直近の内容を優先してデフォルト2,000文字にトリミングします。変更する場合は `--max-chars` を使います。
 
 ```powershell
 python summarize_issues.py --input-dir output/issues --output-csv output/weekly_report.csv --max-chars 6000
 ```
 
+GTX1080 Ti 11GBなどVRAMに余裕が少ない環境では、まず以下の軽量設定を推奨します。
+
+```powershell
+python summarize_issues.py --input-dir output/issues --output-csv output/weekly_report.csv --max-chars 1200 --max-tokens 80 --num-ctx 2048
+```
+
+CSVは1件ごとに保存され、同じ出力先で再実行すると要約済みの行はスキップします。最初から作り直したい場合は `--no-resume` を付けます。
+
 接続確認だけを軽く行う場合は、先頭1件だけ処理できます。
 
 ```powershell
-python summarize_issues.py --input-dir output/issues --output-csv output/test_report.csv --limit 1
+python summarize_issues.py --input-dir output/issues --output-csv output/test_report.csv --limit 1 --max-chars 1200 --max-tokens 80 --num-ctx 2048
+```
+
+Ollama側でGPUが使われているかは、サーバー側で次を確認します。
+
+```bash
+nvidia-smi
+docker logs <ollama-container-name>
+```
+
+`nvidia-smi` でVRAM使用量が増えない場合は、DockerのGPU割り当てを確認してください。例:
+
+```bash
+docker run --gpus all -p 11434:11434 -v ollama:/root/.ollama ollama/ollama
 ```
 
 ## 別サーバーでのOllama動作確認手順
@@ -101,7 +122,7 @@ Ollamaが別ホストで動いている場合は、`OPENAI_BASE_URL=http://<serv
 6. Aの出力済みJSONを `output/issues` に置き、Bを実行します。
 
 ```bash
-python summarize_issues.py --input-dir output/issues --output-csv output/test_report.csv --limit 1
+python summarize_issues.py --input-dir output/issues --output-csv output/test_report.csv --limit 1 --max-chars 1200 --max-tokens 80 --num-ctx 2048
 ```
 
 7. 1件の要約が成功したら、全件を処理します。

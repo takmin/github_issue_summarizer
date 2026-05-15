@@ -14,7 +14,9 @@ from openai import OpenAI
 
 DEFAULT_MODEL = "qwen3.5:9b"
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
-DEFAULT_INPUT_LIMIT = 4000
+DEFAULT_INPUT_LIMIT = 2000
+DEFAULT_MAX_TOKENS = 120
+DEFAULT_NUM_CTX = 4096
 
 SYSTEM_PROMPT = (
     "あなたは優秀なPMです。GitHub Issue/PRのやり取りを読み、"
@@ -24,10 +26,12 @@ SYSTEM_PROMPT = (
 )
 
 USER_PROMPT_TEMPLATE = """以下のIssue/PRのやり取りを読み、顧客向けの週次報告を日本語1文で簡潔にまとめてください。
+/no_think
 
 制約:
 - 出力は要約文のみ
 - 1文で書く
+- 80文字から120文字程度に収める
 - 技術的な経緯は必要な範囲に絞る
 - コメントやタイムラインから現在の状況や決定事項を反映する
 
@@ -134,14 +138,21 @@ def build_issue_context(record: dict[str, Any], max_chars: int) -> str:
     return trim_context(context, max_chars)
 
 
-def create_openai_client() -> OpenAI:
+def create_openai_client(timeout: float) -> OpenAI:
     load_dotenv()
     base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OLLAMA_BASE_URL") or DEFAULT_BASE_URL
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OLLAMA_API_KEY") or "ollama"
-    return OpenAI(base_url=base_url, api_key=api_key)
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
 
 
-def summarize_record(client: OpenAI, record: dict[str, Any], model: str, max_chars: int) -> str:
+def summarize_record(
+    client: OpenAI,
+    record: dict[str, Any],
+    model: str,
+    max_chars: int,
+    max_tokens: int,
+    num_ctx: int,
+) -> str:
     issue_context = build_issue_context(record, max_chars)
     response = client.chat.completions.create(
         model=model,
@@ -150,6 +161,15 @@ def summarize_record(client: OpenAI, record: dict[str, Any], model: str, max_cha
             {"role": "user", "content": USER_PROMPT_TEMPLATE.format(issue_context=issue_context)},
         ],
         temperature=0.2,
+        max_tokens=max_tokens,
+        extra_body={
+            "options": {
+                "num_ctx": num_ctx,
+                "num_predict": max_tokens,
+                "temperature": 0.2,
+            },
+            "keep_alive": "10m",
+        },
     )
     content = response.choices[0].message.content or ""
     return clean_one_sentence(content)
@@ -168,21 +188,44 @@ def build_row(record: dict[str, Any], summary: str) -> dict[str, str]:
     }
 
 
-def summarize_issues(input_dir: Path, output_csv: Path, model: str, max_chars: int, limit: int | None) -> None:
+def load_existing_rows(output_csv: Path) -> list[dict[str, Any]]:
+    if not output_csv.exists():
+        return []
+    return pd.read_csv(output_csv, dtype=str).fillna("").to_dict("records")
+
+
+def summarize_issues(
+    input_dir: Path,
+    output_csv: Path,
+    model: str,
+    max_chars: int,
+    max_tokens: int,
+    num_ctx: int,
+    limit: int | None,
+    timeout: float,
+    resume: bool,
+) -> None:
     records = read_issue_json_files(input_dir)
     if limit is not None:
         records = records[:limit]
     if not records:
         raise RuntimeError(f"No JSON files found in {input_dir}")
 
-    client = create_openai_client()
-    rows: list[dict[str, str]] = []
+    client = create_openai_client(timeout)
+    rows: list[dict[str, Any]] = load_existing_rows(output_csv) if resume else []
+    done_numbers = {row.get("番号") for row in rows if row.get("LLMによる進捗要約")}
     for index, record in enumerate(records, start=1):
         number = number_label(record.get("number"))
+        if resume and number in done_numbers:
+            print(f"[{index}/{len(records)}] Skipping {number} (already summarized)")
+            continue
+
         title = record.get("title") or ""
         print(f"[{index}/{len(records)}] Summarizing {number} {title}")
-        summary = summarize_record(client, record, model, max_chars)
+        summary = summarize_record(client, record, model, max_chars, max_tokens, num_ctx)
         rows.append(build_row(record, summary))
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
@@ -218,16 +261,49 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Maximum characters of context per issue/PR. Default: {DEFAULT_INPUT_LIMIT}",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=int(os.getenv("OPENAI_MAX_TOKENS") or DEFAULT_MAX_TOKENS),
+        help=f"Maximum output tokens per issue/PR. Default: {DEFAULT_MAX_TOKENS}",
+    )
+    parser.add_argument(
+        "--num-ctx",
+        type=int,
+        default=int(os.getenv("OLLAMA_NUM_CTX") or DEFAULT_NUM_CTX),
+        help=f"Ollama context window option. Default: {DEFAULT_NUM_CTX}",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         help="Only summarize the first N JSON files. Useful for connection tests.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=float(os.getenv("OPENAI_TIMEOUT") or 600),
+        help="OpenAI client timeout seconds. Default: 600",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not reuse existing rows in the output CSV.",
     )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    summarize_issues(Path(args.input_dir), Path(args.output_csv), args.model, args.max_chars, args.limit)
+    summarize_issues(
+        Path(args.input_dir),
+        Path(args.output_csv),
+        args.model,
+        args.max_chars,
+        args.max_tokens,
+        args.num_ctx,
+        args.limit,
+        args.timeout,
+        not args.no_resume,
+    )
 
 
 if __name__ == "__main__":
