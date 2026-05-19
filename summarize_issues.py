@@ -258,6 +258,7 @@ def build_row(record: dict[str, Any], summary: str) -> dict[str, str]:
         "番号": number_label(record.get("number")),
         "タイトル": record.get("title") or "",
         "ステータス": record.get("state") or "",
+        "更新日": record.get("updated_at") or "",
         "担当者": join_values(record.get("assignees")),
         "ラベル": join_values(record.get("labels")),
         "LLMによる進捗要約": summary,
@@ -276,7 +277,10 @@ def save_rows(records: list[dict[str, Any]], rows_by_number: dict[str, dict[str,
     for record in records:
         number = number_label(record.get("number"))
         if number in rows_by_number:
-            rows.append(rows_by_number[number])
+            row = dict(rows_by_number[number])
+            if not row.get("更新日"):
+                row["更新日"] = record.get("updated_at") or ""
+            rows.append(row)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output_csv, index=False, encoding="utf-8-sig")
 
